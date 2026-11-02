@@ -1,0 +1,688 @@
+#!/usr/bin/env node
+/**
+ * 蓝色大肥鱼 · B站养鱼管理面板
+ *
+ * 零依赖本地 Web 服务：
+ *  - 托管 public/ 下的单页 UI
+ *  - 提供 /api/*：账号与经验、活动记录、自动养号、刷视频、消息中心、待审、日记
+ *  - 进程内跑自动养号调度器（autopilot.mjs）
+ *
+ * 启动：node panel.mjs → http://127.0.0.1:8899
+ */
+import { createServer } from 'node:http';
+import { readFileSync, existsSync } from 'node:fs';
+import { dirname, join, extname, normalize } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import * as bili from './bili.mjs';
+import * as llm from './llm.mjs';
+import * as auto from './autopilot.mjs';
+import * as notify from './notify.mjs';
+import * as mind from './mind.mjs';
+import * as memory from './memory.mjs';
+import * as social from './social.mjs';
+import * as sky from './sky.mjs';
+import * as health from './health.mjs';
+import * as qq from './qq/index.mjs';
+import * as napcat from './qq/napcat.mjs';
+import * as owner from './qq/owner.mjs';
+import * as web from './web.mjs';
+import * as webvisit from './webvisit.mjs';
+import * as tieba from './tieba.mjs';
+import * as douyin from './douyin.mjs';
+import * as bililive from './bililive.mjs';
+import * as remind from './remind.mjs';
+import * as setup from './setup.mjs';
+import { openAsHer } from './browser.mjs';
+import {
+  FILES, SHICHEN, localDate, logAction, readActions, readTasks, addTask, updateTask,
+  readReview, updateReview, readConfig, writeConfig, readSecrets, writeSecrets,
+  readState, writeState, readJsonl, todayCounts, nowIso,
+  readBlocks, clearBlock, withBlock, ACTION_NAMES, readVip, writeVip, readWishes, finishWish, readPause, clearPause,
+  who,
+} from './store.mjs';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const PUBLIC = join(here, 'public');
+const PORT = Number(process.env.PANEL_PORT || 8899);
+const HOST = '127.0.0.1';
+
+// ─── B站数据缓存：面板每 30 秒刷新，但别每次都去敲 B站 ──────
+// 一个号每 15 秒查一次 nav + 经验 + 未读，本身就很不像真人。
+const cache = new Map();
+async function cached(key, ttlMs, fn) {
+  const hit = cache.get(key);
+  if (hit && Date.now() - hit.at < ttlMs) return hit.value;
+  const value = await fn();
+  cache.set(key, { at: Date.now(), value });
+  return value;
+}
+const bust = (...keys) => keys.forEach((k) => cache.delete(k));
+
+// ─── 统计 ──────────────────────────────────────────────────
+function dailySeries(days = 14) {
+  const out = [];
+  const byDay = {};
+  for (const a of readActions()) {
+    if (!a.ok) continue;
+    const d = localDate(new Date(a.ts));
+    const o = (byDay[d] ||= { watch: 0, like: 0, comment: 0, share: 0, seconds: 0 });
+    if (a.kind === 'watch') { o.watch++; o.seconds += Number(a.meta?.played || 0); }
+    else if (a.kind === 'like') o.like++;
+    else if (a.kind === 'comment' || a.kind === 'reply_comment') o.comment++;
+    else if (a.kind === 'share') o.share++;
+  }
+  for (let i = days - 1; i >= 0; i--) {
+    const d = localDate(new Date(Date.now() - i * 86400_000));
+    out.push({ date: d, ...(byDay[d] || { watch: 0, like: 0, comment: 0, share: 0, seconds: 0 }) });
+  }
+  return out;
+}
+
+function autopilotView() {
+  const cfg = readConfig();
+  const state = readState();
+  let plan = [];
+  try { plan = auto.todayPlan(); } catch { /* ignore */ }
+  return {
+    config: cfg,
+    shichen: SHICHEN,
+    plan,
+    live: auto.liveStatus(),
+    lastRun: state.lastRun || null,
+    cooldownUntil: state.cooldownUntil && state.cooldownUntil > Date.now() ? state.cooldownUntil : null,
+    pause: readPause(),
+    llmReady: llm.llmReady(),
+    llmUsage: llm.usageView(),
+    hasKey: !!readSecrets().llmApiKey,
+    coinLock: bili.coinLock(),
+    social: social.socialView(),
+    blocks: Object.entries(readBlocks()).map(([kind, b]) => ({ kind, name: ACTION_NAMES[kind] || kind, ...b })),
+  };
+}
+
+// 特别关注名单 + 我是否已关注 TA（动态流里只有关注了的人）
+async function vipUsers() {
+  const users = readConfig().vip.users;
+  return cached('vipRel:' + users.map((u) => u.uid).join(','), 10 * 60_000, async () => {
+    const out = [];
+    for (const u of users) {
+      const rel = await bili.relationWith(u.uid).catch(() => null);
+      out.push({ ...u, following: rel ? rel.following : null });
+    }
+    return out;
+  });
+}
+
+// ─── HTTP 工具 ─────────────────────────────────────────────
+function json(res, code, obj) {
+  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+  res.end(JSON.stringify(obj));
+}
+async function readBody(req) {
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  const raw = Buffer.concat(chunks).toString('utf-8');
+  if (!raw) return {};
+  try { return JSON.parse(raw); } catch { return {}; }
+}
+const MIME = {
+  '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png',
+  '.ico': 'image/x-icon', '.json': 'application/json', '.mp3': 'audio/mpeg',
+};
+
+/** 聊天框里的语音、表情包：只认文件名（不带路径），只从这两个目录里拿 */
+function serveChatMedia(res, p, q) {
+  const dirs = { '/api/chat/voice': [qq.VOICE_DIR, '.mp3'], '/api/chat/sticker': [join(here, '..', 'stickers'), '.png'] };
+  const [dir, ext] = dirs[p] || [];
+  const name = String(q.get('f') || '');
+  if (!dir || !/^[\w\u4e00-\u9fff.-]{1,80}$/.test(name) || name.includes('..')) return false;
+  const file = join(dir, name.endsWith(ext) ? name : name + ext);
+  if (!existsSync(file)) return false;
+  res.writeHead(200, { 'Content-Type': MIME[ext], 'Cache-Control': 'private, max-age=86400' });
+  res.end(readFileSync(file));
+  return true;
+}
+function serveStatic(res, p) {
+  const rel = normalize(p === '/' ? '/index.html' : p).replace(/^(\.\.[/\\])+/, '');
+  const file = join(PUBLIC, rel);
+  if (!file.startsWith(PUBLIC) || !existsSync(file)) return false;
+  res.writeHead(200, { 'Content-Type': MIME[extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-cache' });
+  res.end(readFileSync(file));
+  return true;
+}
+
+/**
+ * 防跨站：面板只给本机浏览器用。别的网页可以往 127.0.0.1 发请求（CSRF / DNS rebinding），
+ * 所以校验 Host，写操作还要求 JSON（跨站发 JSON 会触发 CORS 预检，被浏览器拦下）且 Origin 匹配。
+ */
+function allowed(req) {
+  const host = String(req.headers.host || '');
+  if (!/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host)) return false;
+  if (req.method === 'GET') return true;
+  const origin = req.headers.origin;
+  if (origin && !/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(origin)) return false;
+  return String(req.headers['content-type'] || '').includes('application/json');
+}
+
+// ─── 路由 ──────────────────────────────────────────────────
+const routes = {
+  // 总览：账号、经验、今日、未读、自动养号、近 14 天
+  'GET /api/overview': async () => {
+    const [account, exp, unread] = await Promise.all([
+      cached('account', 120_000, bili.getAccountStatus).catch((e) => ({ error: e.message })),
+      cached('exp', 120_000, bili.getExpStatus).catch((e) => ({ error: e.message })),
+      cached('unread', 90_000, bili.unreadCounts).catch(() => null),
+    ]);
+    return {
+      account, exp, unread,
+      today: todayCounts(),
+      series: dailySeries(14),
+      tasksPending: readTasks().filter((t) => t.status === 'pending').length,
+      reviewPending: readReview().filter((r) => r.status === 'pending').length,
+      autopilot: autopilotView(),
+      health: await health.status(),
+    };
+  },
+  'GET /api/health': async (q) => (q.get('fresh') ? await health.check() : await health.status()),
+
+  // 扫码登录（掉登录时用）
+  'POST /api/login/qr': async () => bili.qrLoginStart(),
+  'GET /api/login/poll': async (q) => {
+    const key = q.get('key');
+    if (!key) throw new Error('缺 key');
+    const r = await bili.qrLoginPoll(key);
+    if (r.status === 'ok') {
+      cache.clear(); // 旧账号状态全作废
+      logAction({ kind: 'login', target: r.uid, detail: '扫码重新登录了 B站' });
+    }
+    return r;
+  },
+
+  // 活动记录
+  'GET /api/actions': async (q) => {
+    let list = readActions();
+    const kind = q.get('kind'); const source = q.get('source'); const date = q.get('date'); const s = q.get('q');
+    if (kind) list = list.filter((a) => kind.split(',').includes(a.kind));
+    if (source) list = list.filter((a) => a.source === source || (!a.source && source === 'panel'));
+    if (date) list = list.filter((a) => localDate(new Date(a.ts)) === date);
+    if (s) list = list.filter((a) => `${a.title} ${a.detail} ${a.target}`.includes(s));
+    const limit = Number(q.get('limit') || 200);
+    return { total: list.length, list: list.slice(-limit).reverse() };
+  },
+
+  // 任务箱
+  'GET /api/tasks': async () => ({ tasks: readTasks().slice(0, 80) }),
+  'POST /api/tasks': async (_q, b) => {
+    const map = {
+      browse: '随便刷刷B站，看到有意思的点个赞、写两句感想',
+      browse_like: '刷B站，挑喜欢的点赞',
+      comment: '挑几个视频留两句真实感想',
+      diary: '把今天刷到的写进养鱼日记，晚上发动态',
+      check: '看看有没有新评论和私信要回',
+    };
+    if (!map[b.type] && !b.note) throw new Error('未知任务类型');
+    const executor = b.executor === 'bot' ? 'bot' : 'panel';
+    // QQ 里的她（panel/bg.mjs）交给后台的活带 report: 'qq'，做完由后台在 QQ 里汇报
+    const fromBot = b.report === 'qq';
+    const task = addTask({
+      type: b.type || 'custom', note: b.note || map[b.type], payload: b.payload, executor,
+      source: fromBot ? 'bot' : 'panel', report: fromBot ? 'qq' : undefined,
+    });
+    if (executor === 'panel') {
+      if (readState().cooldownUntil > Date.now()) {
+        updateTask(task.id, { status: 'failed', resultNote: '风控冷却中，先别派活' });
+        throw new Error('风控冷却中，先在总览里解除冷却');
+      }
+      auto.runTask(task).then(() => bust('exp', 'account'));
+    }
+    return { ok: true, task };
+  },
+  'POST /api/tasks/cancel': async (_q, b) => { updateTask(b.id, { status: 'cancelled', doneAt: nowIso() }); return { ok: true }; },
+
+  // 自动养号
+  'GET /api/autopilot': async () => autopilotView(),
+  'POST /api/autopilot/config': async (_q, b) => {
+    const { llmApiKey, geminiApiKey, qqAppId, qqAppSecret, qqOpenId, onebotToken, telegramToken, modelscopeToken, ...patch } = b;
+    if (typeof modelscopeToken === 'string' && modelscopeToken.trim()) writeSecrets({ modelscopeToken: modelscopeToken.trim() });
+    if (typeof llmApiKey === 'string') writeSecrets({ llmApiKey: llmApiKey.trim() });
+    // geminiApiKey 只剥离不落库：切模型现在走同一个网关，不再需要单独的密钥
+    void geminiApiKey;
+    if (typeof onebotToken === 'string' && onebotToken.trim()) writeSecrets({ onebotToken: onebotToken.trim() });
+    if (typeof telegramToken === 'string' && telegramToken.trim()) writeSecrets({ telegramToken: telegramToken.trim() });
+    // QQ 提醒的凭证：只存本机 secrets.json，留空表示不改
+    for (const [k, v] of Object.entries({ qqAppId, qqAppSecret, qqOpenId })) {
+      if (typeof v === 'string' && v.trim()) writeSecrets({ [k]: v.trim() });
+    }
+    const before = readConfig();
+    // 她的窗：城市名变了就查一下经纬度；清空就不看天了
+    if (patch.sky && typeof patch.sky.place === 'string') {
+      const place = patch.sky.place.trim();
+      if (!place) Object.assign(patch.sky, { place: '', label: '', lat: null, lon: null });
+      else if (place !== before.sky.place || !Number.isFinite(before.sky.lat)) Object.assign(patch.sky, { place, ...(await sky.geocode(place)) });
+      else Object.assign(patch.sky, { lat: before.sky.lat, lon: before.sky.lon, label: before.sky.label });
+    }
+    // 线路和 Telegram 绑定不归这个接口管：线路走 /api/qq/mode，绑定由后端认第一个私聊的人。
+    // 页面里的 config 是加载时的快照，切完线路没刷新页面就会带着旧值回来 —— 这里兜一道，
+    // 否则一次普通保存就能把线路打回加载时那个（表现为「过一会自己切回官方机器人」）。
+    if (patch.qq) { delete patch.qq.mode; delete patch.qq.tg; }
+    const cfg = writeConfig(patch);
+    if (JSON.stringify(before.windows) !== JSON.stringify(cfg.windows) || before.windowChance !== cfg.windowChance) auto.replanToday();
+    if (before.enabled !== cfg.enabled) logAction({ kind: 'autopilot', detail: cfg.enabled ? '打开了自动养号' : '关掉了自动养号' });
+    // QQ 连接的设置变了（或者换了 token）就重连
+    const qqKeys = (c) => JSON.stringify([c.qq.mode, c.qq.wsUrl, c.qq.ownerQQ]);
+    if (qqKeys(before) !== qqKeys(cfg) || onebotToken || telegramToken) {
+      qq.start();
+      if (before.qq.mode !== cfg.qq.mode) logAction({ kind: 'qq', detail: { onebot: 'QQ 换成了她自己的小号', official: 'QQ 换回了官方机器人（DSH 插件）', telegram: '换到了 Telegram' }[cfg.qq.mode] });
+    }
+    return autopilotView();
+  },
+  'POST /api/autopilot/replan': async () => { auto.replanToday(); return autopilotView(); },
+  'POST /api/autopilot/run': async (_q, b) => {
+    const st = readState();
+    if (st.cooldownUntil && st.cooldownUntil > Date.now()) throw new Error('风控冷却中，先在总览里解除冷却');
+    if (auto.liveStatus().running) throw new Error('她已经在刷了');
+    const videos = b.bvid ? [{ bvid: b.bvid }] : undefined;
+    auto.runSession({ reason: b.bvid ? '面板点播' : '面板手动', videos }).then(() => bust('exp', 'account'));
+    await new Promise((r) => setTimeout(r, 300));
+    return autopilotView();
+  },
+  'POST /api/autopilot/stop': async () => { auto.stopSession(); return { ok: true }; },
+  'POST /api/pause/clear': async () => { clearPause({ source: 'panel' }); return autopilotView(); },
+  'POST /api/autopilot/clear-cooldown': async () => {
+    const s = readState(); s.cooldownUntil = null; writeState(s);
+    logAction({ kind: 'autopilot', detail: '手动解除了风控冷却' });
+    return autopilotView();
+  },
+  'POST /api/autopilot/llm-test': async () => ({ ok: true, reply: await llm.ping() }),
+  'POST /api/autopilot/llm-models': async () => ({ models: await llm.listModels() }),
+  'POST /api/blocks/clear': async (_q, b) => {
+    clearBlock(b.kind);
+    logAction({ kind: 'autopilot', detail: `手动恢复了「${ACTION_NAMES[b.kind] || b.kind}」` });
+    return autopilotView();
+  },
+
+  // 特别关注
+  'GET /api/vip': async () => auto.vipView(),
+  'POST /api/vip/add': async (_q, b) => {
+    const uid = String(b.uid || '').match(/\d{1,20}/)?.[0];
+    if (!uid) throw new Error('填 UID，或者贴 TA 的空间链接（space.bilibili.com/数字）');
+    const cfg = readConfig();
+    if (cfg.vip.users.some((u) => u.uid === uid)) throw new Error('已经在特别关注里了');
+    const card = (await bili.userCards([uid]))[uid] || {};
+    if (!card.name) throw new Error('查不到这个 UID');
+    writeConfig({ vip: { users: [...cfg.vip.users, { uid, name: card.name, face: card.face || '' }] } });
+    // 以前加过又删掉的：忘掉当时处理过的动态，重新按「最近 N 小时」来追
+    const vq = readVip();
+    vq.handled = Object.fromEntries(Object.entries(vq.handled || {}).filter(([, h]) => h.uid !== uid));
+    writeVip(vq);
+    logAction({ kind: 'vip', target: uid, detail: `把「${card.name}」加进了特别关注` });
+    return { ...auto.vipView(), users: await vipUsers() };
+  },
+  'POST /api/vip/remove': async (_q, b) => {
+    const cfg = readConfig();
+    const u = cfg.vip.users.find((x) => x.uid === String(b.uid));
+    writeConfig({ vip: { users: cfg.vip.users.filter((x) => x.uid !== String(b.uid)) } });
+    const vq = readVip();
+    vq.queue = vq.queue.filter((q) => q.uid !== String(b.uid));
+    writeVip(vq);
+    if (u) logAction({ kind: 'vip', target: u.uid, detail: `把「${u.name}」移出了特别关注` });
+    return { ...auto.vipView(), users: await vipUsers() };
+  },
+  'POST /api/vip/import': async () => {
+    const list = await bili.specialFollowings();
+    const cfg = readConfig();
+    const fresh = list.filter((u) => !cfg.vip.users.some((x) => x.uid === u.uid));
+    if (fresh.length) writeConfig({ vip: { users: [...cfg.vip.users, ...fresh] } });
+    return { ...auto.vipView(), users: await vipUsers(), imported: fresh.length, total: list.length };
+  },
+  'GET /api/vip/users': async () => ({ users: await vipUsers() }),
+  'POST /api/vip/follow': async (_q, b) => {
+    await withBlock('follow', () => bili.followUser(String(b.uid)));
+    for (const k of cache.keys()) if (k.startsWith('vipRel')) cache.delete(k);
+    logAction({ kind: 'follow', target: String(b.uid), title: b.name, detail: `关注了「${b.name || b.uid}」` });
+    return { users: await vipUsers() };
+  },
+  'POST /api/vip/check': async () => {
+    const r = await auto.checkVip({ force: true });
+    return { ...auto.vipView(), found: r.found };
+  },
+  'POST /api/vip/run': async () => {
+    const st = readState();
+    if (st.cooldownUntil && st.cooldownUntil > Date.now()) throw new Error('风控冷却中，先在总览里解除冷却');
+    if (auto.liveStatus().running) throw new Error('她已经在刷了');
+    if (!auto.vipView().queue.length) throw new Error('特别关注暂时没有新东西');
+    auto.runSession({ reason: '面板 · 特别关注', vipOnly: true }).then(() => bust('exp', 'account'));
+    await new Promise((r) => setTimeout(r, 300));
+    return autopilotView();
+  },
+  'POST /api/coin/unlock': async () => {
+    bili.unlockCoin();
+    logAction({ kind: 'autopilot', detail: '手动解锁了投币' });
+    return autopilotView();
+  },
+
+  // 经验
+  'GET /api/exp': async () => cached('exp', 60_000, bili.getExpStatus),
+
+  // 刷视频
+  'GET /api/feed': async () => {
+    const list = await bili.feedVideos(12);
+    logAction({ kind: 'feed', detail: `刷了刷首页推荐（${list.length} 条）` });
+    return { list };
+  },
+  'GET /api/hot': async () => ({ list: await cached('hot', 300_000, () => bili.hotVideos(30)) }),
+  'GET /api/search': async (q) => {
+    const kw = q.get('q') || '';
+    if (!kw) throw new Error('缺关键词');
+    const list = await bili.searchVideo(kw, q.get('order') || 'totalrank');
+    logAction({ kind: 'search', target: kw, detail: `搜「${kw}」，${list.length} 条` });
+    return { list };
+  },
+  'GET /api/video': async (q) => {
+    const bvid = q.get('bvid');
+    if (!bvid) throw new Error('缺 bvid');
+    const video = await bili.browseVideo(bvid);
+    logAction({ kind: 'view', target: bvid, title: video.title, detail: `打开了《${video.title}》` });
+    return { video };
+  },
+  'GET /api/comments': async (q) => bili.videoComments(q.get('bvid'), q.get('aid'), Number(q.get('page') || 1)),
+  'GET /api/history': async () => ({ list: await cached('history', 60_000, () => bili.watchHistory(30)) }),
+
+  'POST /api/like': async (_q, b) => {
+    await withBlock('like', () => bili.likeVideo(b.bvid, b.like !== false));
+    logAction({ kind: 'like', target: b.bvid, title: b.title, detail: b.like !== false ? `给《${b.title || b.bvid}》点了赞` : '取消赞' });
+    return { ok: true };
+  },
+  'POST /api/share': async (_q, b) => {
+    await withBlock('share', () => bili.shareVideo(b.bvid));
+    bust('exp');
+    logAction({ kind: 'share', target: b.bvid, title: b.title, detail: `分享了《${b.title || b.bvid}》` });
+    return { ok: true };
+  },
+  'POST /api/favorite': async (_q, b) => {
+    const r = await withBlock('favorite', () => bili.favoriteVideo(b.bvid));
+    if (!r.already) logAction({ kind: 'favorite', target: b.bvid, title: b.title, detail: `收藏了《${b.title || b.bvid}》` });
+    return { ok: true, already: r.already };
+  },
+  'POST /api/coin': async (_q, b) => {
+    try {
+      const r = await bili.coinVideo(b.bvid, 1);
+      bust('exp', 'account');
+      logAction({ kind: 'coin', target: b.bvid, title: b.title, detail: `给《${b.title || b.bvid}》投了 1 个币` });
+      return r;
+    } catch (e) {
+      logAction({ kind: 'coin', ok: false, target: b.bvid, error: e.message, detail: '投币失败' });
+      throw e;
+    }
+  },
+  'POST /api/comment': async (_q, b) => {
+    const { bvid, oid, type, message, rootRpid, parentRpid, title } = b;
+    if (!message || (!bvid && !oid)) throw new Error('缺视频或内容');
+    const r = await bili.postComment({ bvid, oid, type, message, rootRpid, parentRpid });
+    logAction({ kind: rootRpid ? 'reply_comment' : 'comment', target: bvid || oid, title, detail: message.slice(0, 120) });
+    bust('replyFeed');
+    return { ok: true, rpid: r.rpid };
+  },
+
+  // 消息中心
+  'GET /api/inbox/unread': async () => cached('unread', 30_000, bili.unreadCounts),
+  'GET /api/inbox/reply': async () => { const list = await cached('replyFeed', 30_000, bili.replyFeed); bust('unread'); return { list }; },
+  'GET /api/inbox/at': async () => { const list = await cached('atFeed', 30_000, bili.atFeed); bust('unread'); return { list }; },
+  'GET /api/inbox/like': async () => { const list = await cached('likeFeed', 60_000, bili.likeFeed); bust('unread'); return { list }; },
+  'GET /api/messages/sessions': async () => ({ list: await cached('sessions', 20_000, bili.listSessions) }),
+  'GET /api/messages/list': async (q) => {
+    const talkerId = q.get('talkerId');
+    if (!talkerId) throw new Error('缺 talkerId');
+    return { list: await bili.listMessages(talkerId) };
+  },
+  'POST /api/messages/read': async (_q, b) => {
+    if (!b.talkerId) throw new Error('缺 talkerId');
+    await bili.markSessionRead(b.talkerId, b.seqno);
+    bust('sessions', 'unread');
+    return { ok: true };
+  },
+  'POST /api/messages/send': async (_q, b) => {
+    if (!b.uid || !b.text) throw new Error('缺 uid 或 text');
+    const r = await bili.sendPrivateMessage(b.uid, b.text);
+    logAction({ kind: 'dm_send', target: b.uid, title: b.name, detail: b.text.slice(0, 120) });
+    bust('sessions');
+    return { ok: true, msgKey: r.msgKey };
+  },
+
+  // AI 起草回复（只起草，不发）
+  'POST /api/ai/reply': async (_q, b) => {
+    const text = await llm.draftReply({ context: b.context, message: b.message, kind: b.kind });
+    if (!text) throw new Error('她没想好怎么回（或者内容没过安全检查），自己写一句吧');
+    return { text };
+  },
+  'POST /api/ai/comment': async (_q, b) => {
+    const video = await bili.browseVideo(b.bvid);
+    const text = await llm.draftComment(video, { essential: true });
+    if (!text) throw new Error('她觉得这个视频没什么想说的');
+    return { text };
+  },
+
+  // 待审
+  'GET /api/review': async () => ({ list: readReview().slice(0, 60) }),
+  'POST /api/review/approve': async (_q, b) => {
+    const r = await auto.approveReview(b.id, b.text, 'panel');
+    bust('replyFeed');
+    return { ok: true, ...r };
+  },
+  'POST /api/review/reject': async (_q, b) => { auto.rejectReview(b.id, 'panel'); return { ok: true }; },
+
+  // 接口被拦、等你在「她的浏览器」里点的
+  'GET /api/wishes': async () => ({ list: readWishes() }),
+  'POST /api/wishes/done': async (_q, b) => { finishWish(b.id || '*'); return { list: readWishes() }; },
+  // 在「她的浏览器」里打开：共用引擎的登录态，不用（也不能）在浏览器里重新登录她的号
+  'POST /api/browser/open': async (_q, b) => {
+    if (!/^BV\w{10}$/.test(b.bvid || '')) throw new Error('要给 BV 号');
+    return openAsHer(`https://www.bilibili.com/video/${b.bvid}`);
+  },
+
+  // 她的内心
+  'GET /api/mind': async () => mind.dayViewWithSky(),
+  // 她的记忆流：记错了的可以删
+  'POST /api/memory/delete': async (_q, b) => ({ ok: memory.remove(String(b.id || '')), ...memory.memoryView(15) }),
+  'POST /api/memory/update': async (_q, b) => {
+    if (!memory.update(String(b.id || ''), { text: b.text, imp: b.imp })) throw new Error('没改成：找不到这条，或者内容是空的 / 没过安全检查');
+    return memory.memoryView(15);
+  },
+  'GET /api/memory/graph': async () => ({
+    memories: memory.graphData(),
+    facts: owner.readFacts().map((f) => ({ id: f.id, kind: f.kind, text: f.text, at: f.at })),
+    consts: { fuzzyR: 0.2, forgetR: Math.exp(-3) },
+  }),
+  'POST /api/memory/tidy': async () => ({ result: await mind.tidyMemory(), ...memory.memoryView(15) }),
+  'POST /api/social/check': async () => {
+    if (!social.socialOn()) throw new Error('先打开「评论区社交」并配好模型');
+    const r = await social.checkInbox({ essential: true });
+    bust('unread', 'replyFeed');
+    return { note: r.note, social: social.socialView() };
+  },
+
+  // QQ 提醒
+  'POST /api/notify/test': async () => ({ ok: true, ...(await notify.sendOwner('🐟 测试一下：以后有要你审的东西，我会在这里叫你～')) }),
+  'GET /api/notify': async () => notify.status(),
+
+  // QQ 小号
+  'GET /api/qq': async () => qq.panelStatus(),
+  'POST /api/qq/test': async () => qq.test(),
+  // 一键切线路：改配置 + 起停 NapCat 容器 + 重连（面板「QQ 连接」顶上那两个按钮）
+  'POST /api/qq/mode': async (_q, b) => {
+    const r = await qq.setMode(String(b.mode || ''), { startNapcat: b.startNapcat !== false });
+    return { ok: true, ...r, ...(await qq.panelStatus()) };
+  },
+  'POST /api/qq/napcat': async (_q, b) => {
+    const what = String(b.action || '');
+    if (what === 'up') await napcat.up();
+    else if (what === 'down') await napcat.down();
+    else if (what === 'restart') await napcat.restart();
+    else throw new Error('只支持 up / down / restart');
+    return { ok: true, ...(await qq.panelStatus()) };
+  },
+  'POST /api/qq/napcat/logs': async (_q, b) => ({ log: await napcat.logs(b.limit) }),
+  'POST /api/qq/tg/unbind': async () => { qq.unbindTg(); return qq.panelStatus(); },
+  'POST /api/qq/import-dsh': async () => ({ ...(await owner.importDsh()), ...qq.status() }),
+  'POST /api/qq/fact/delete': async (_q, b) => { owner.removeFact(String(b.id || '')); return qq.status(); },
+  'POST /api/qq/fact/update': async (_q, b) => { owner.updateFact(String(b.id || ''), String(b.text || '')); return qq.status(); },
+
+  // 日记
+  'GET /api/diary': async () => {
+    const all = readJsonl(FILES.diary);
+    const published = all.filter((e) => e.type === 'published');
+    const drafts = all.filter((e) => e.type === 'draft').reverse().slice(0, 30).map((d) => ({
+      ...d, dynId: published.find((p) => p.date === d.date && p.ts >= d.ts)?.dynId || null,
+    }));
+    return { drafts, publishedToday: published.some((p) => p.date === localDate()) };
+  },
+  'POST /api/diary/publish': async (_q, b) => {
+    const text = String(b.text || '').trim();
+    if (!text) throw new Error('写点什么再发');
+    return auto.publishDiary(text, 'panel', { force: true });
+  },
+
+  // ─── 面板聊天框：跟 QQ 同一个她、同一份聊天记录 ─────────────────
+  'GET /api/chat': async (q) => qq.chatView(String(q.get('after') || '')),
+  'POST /api/chat': async (_q, b) => qq.panelChat(b.text),
+  'GET /api/persona': async () => who(),
+  'GET /api/setup': async () => setup.checks(),
+  'GET /api/reminders': async () => ({ list: remind.upcoming().map((r) => ({ ...r, when: remind.whenText(r.at, r.repeat) })) }),
+  'POST /api/reminders': async (_q, b) => remind.addReminder({ when: b.when, text: b.text, repeat: b.repeat, source: 'panel' }),
+  'POST /api/reminders/cancel': async (_q, b) => { const r = remind.cancelReminder(b.id, 'panel'); if (!r) throw new Error('没找到这个提醒'); return r; },
+
+  // ─── B站 直播 ──────────────────────────────────────────────
+  'GET /api/live': async () => bililive.view(),
+  'POST /api/live/config': async (_q, b) => {
+    const c = b?.live || b || {};
+    const patch = {};
+    if ('enabled' in c) patch.enabled = !!c.enabled;
+    if ('perDay' in c) patch.perDay = Math.min(6, Math.max(0, Number(c.perDay) || 0));
+    if ('minutes' in c) patch.minutes = Math.min(30, Math.max(1, Number(c.minutes) || 5));
+    if ('danmaku' in c) patch.danmaku = !!c.danmaku;
+    if ('chat' in c) patch.chat = !!c.chat;
+    if ('stayMaxHours' in c) patch.stayMaxHours = Math.min(12, Math.max(0.5, Number(c.stayMaxHours) || 4));
+    if ('danmakuPerHour' in c) patch.danmakuPerHour = Math.min(20, Math.max(1, Number(c.danmakuPerHour) || 6));
+    writeConfig({ live: patch });
+    return bililive.view();
+  },
+  // 面板「去看直播」：跟 QQ 里派的一样走任务箱，活动记录里看得到
+  'POST /api/live/watch': async (_q, b) => {
+    if (bililive.isBusy()) throw new Error(bililive.isStaying() ? '她正陪你看着呢，先叫她出来' : '她正在看直播，等这场看完');
+    if (readState().cooldownUntil > Date.now()) throw new Error('风控冷却中，先在总览里解除冷却');
+    const target = String(b.target || '').trim().slice(0, 60);
+    const room = bililive.roomFrom(target) || (/^\d{2,12}$/.test(target) ? target : '');
+    const payload = room ? { room } : target ? { keyword: target } : {};
+    if (b.stay) Object.assign(payload, { stay: true, danmaku: !!b.danmaku });
+    const what = target ? `「${target}」的直播` : '直播';
+    const task = addTask({ type: 'live', payload, note: b.stay ? `陪我看${target ? what : '会儿直播'}` : target ? `去看${what}` : '随便看会儿直播', executor: 'panel', source: 'panel' });
+    auto.runTask(task).catch(() => {});
+    return { ok: true, task };
+  },
+  'POST /api/live/stop': async () => { bililive.leave().catch(() => {}); return { ok: true }; },
+  'POST /api/live/danmaku': async (_q, b) => ({ ok: bililive.setDanmaku(!!b.on) }),
+  'GET /api/live/search': async (q) => {
+    const kw = String(q.get('q') || '').trim();
+    return { list: kw ? await bili.searchLive(kw) : await bili.liveFollowing().catch(() => []) };
+  },
+
+  // ─── 贴吧 / 抖音：她自己去逛 ───────────────────────────────
+  'GET /api/web': async () => ({ ...webvisit.view(), browser: await web.status() }),
+  'POST /api/web/config': async (_q, b) => {
+    // 只收 web 这一段，别的字段一律不认 —— 避免又出现「保存时把整份 config 写回去」那种串味
+    const patch = b?.web && typeof b.web === 'object' ? b.web : b;
+    writeConfig({ web: patch });
+    return webvisit.view();
+  },
+  // 手动让她去逛一次（面板按钮）
+  'POST /api/web/run': async (_q, b) => {
+    const site = String(b.site || 'auto');
+    if (!['tieba', 'douyin', 'auto'].includes(site)) throw new Error('站点只能是 tieba / douyin / auto');
+    if (webvisit.isBusy()) throw new Error('她已经在逛了，等这一轮完');
+    webvisit.run({ site, reason: '面板点的' }).catch(() => {});
+    return { ok: true, started: site };
+  },
+  'POST /api/web/stop': async () => { webvisit.stop(); return { ok: true }; },
+  // 搜吧：面板上想找某个吧叫什么的时候用
+  'GET /api/web/forums': async (q) => {
+    const kw = String(q.get('q') || '').trim();
+    if (!kw) throw new Error('要一个关键词');
+    return { keyword: kw, list: await webvisit.searchForums(kw) };
+  },
+  // 某个站点现在能看到什么（面板上「先看一眼」用，不写任何东西）
+  'GET /api/web/browse': async (q) => {
+    const site = String(q.get('site') || 'tieba');
+    if (site === 'tieba') {
+      const forum = String(q.get('forum') || '').trim();
+      if (!forum) throw new Error('要一个吧名');
+      // forumThreads 给的是 { forum, page, threads }，这里统一成 list 给页面用
+      const r = await tieba.forumThreads(forum, { page: Number(q.get('page') || 0) });
+      return { site, forum, list: Array.isArray(r) ? r : (r?.threads || []) };
+    }
+    if (site === 'douyin') return { site, list: await douyin.hotVideos({ limit: 30 }) };
+    throw new Error('站点只能是 tieba / douyin');
+  },
+  // 看一个帖子 / 一条抖音（只读）
+  'GET /api/web/thread': async (q) => tieba.threadDetail(String(q.get('tid') || '')),
+  'GET /api/web/video': async (q) => {
+    const vid = String(q.get('vid') || '');
+    const [detail, commentsRaw] = await Promise.all([
+      douyin.videoDetail(vid).catch(() => null),
+      douyin.videoComments(vid, { limit: 30 }).catch(() => []),
+    ]);
+    // videoComments 把 loginWall / capped 挂在数组对象上，JSON.stringify 会丢掉，所以单独提出来
+    const comments = Array.isArray(commentsRaw) ? commentsRaw : [];
+    return { detail, comments, loginWall: !!commentsRaw?.loginWall, capped: !!commentsRaw?.capped };
+  },
+  // 登录态 + 扫码
+  'GET /api/web/login': async () => webvisit.loginState(),
+  'POST /api/web/login/qr': async (_q, b) => webvisit.loginQr(String(b.site || '')),
+  'GET /api/web/login/poll': async (q) => webvisit.loginPoll(String(q.get('site') || '')),
+  // 关掉浏览器（她逛完、或者卡住了要重开）
+  'POST /api/web/browser/close': async () => { await web.shutdown(); return { ok: true }; },
+};
+
+const server = createServer(async (req, res) => {
+  const url = new URL(req.url, `http://${HOST}:${PORT}`);
+  const p = url.pathname;
+  if (!allowed(req)) return json(res, 403, { error: 'forbidden' });
+
+  if (req.method === 'GET' && !p.startsWith('/api/')) {
+    if (serveStatic(res, p)) return;
+    return json(res, 404, { error: 'not found' });
+  }
+  if (req.method === 'GET' && p.startsWith('/api/chat/') && serveChatMedia(res, p, url.searchParams)) return;
+  const handler = routes[`${req.method} ${p}`];
+  if (!handler) return json(res, 404, { error: 'not found' });
+  try {
+    const body = req.method === 'POST' ? await readBody(req) : {};
+    return json(res, 200, await handler(url.searchParams, body));
+  } catch (err) {
+    const msg = String(err?.message || err);
+    if (req.method === 'POST') logAction({ kind: 'error', ok: false, error: msg, detail: `${p} 失败` });
+    return json(res, 500, { error: msg, code: err?.code ?? null });
+  }
+});
+
+// 端口被占时不要甩未捕获异常：说明已经有一个面板在服务同一端口，
+// 本进程是多余的。以 0 退出，KeepAlive(SuccessfulExit=false) 才不会反复重拉成重启风暴。
+server.on('error', (err) => {
+  if (err && err.code === 'EADDRINUSE') {
+    console.log(`\n🐟 端口 ${PORT} 已被占用（多半是已经有一个养鱼面板在跑），本实例退出。\n`);
+    process.exit(0);
+  }
+  console.error(`\n🐟 面板服务出错：${err?.message || err}\n`);
+  process.exit(1);
+});
+
+server.listen(PORT, HOST, () => {
+  console.log(`\n🐟 养鱼面板已启动：http://${HOST}:${PORT}\n`);
+  auto.startScheduler();
+  webvisit.startScheduler(); // 贴吧 / 抖音：一天插进去几次串门，跟 B站 那套作息互不干扰
+  qq.start(); // 用小号时连 NapCat；用官方机器人时什么都不做
+  qq.startReminders(); // 到点提醒：没连 QQ 也会说在面板聊天框里
+  // QQ 接入体检：DSH 自动升级后插件跟不上会静悄悄掉线，5 分钟看一眼
+  setTimeout(() => health.check().catch(() => {}), 60_000);
+  setInterval(() => health.check().catch(() => {}), 5 * 60_000);
+});
