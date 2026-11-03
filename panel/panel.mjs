@@ -591,7 +591,10 @@ const routes = {
   'GET /api/web': async () => ({ ...webvisit.view(), browser: await web.status() }),
   'POST /api/web/config': async (_q, b) => {
     // 只收 web 这一段，别的字段一律不认 —— 避免又出现「保存时把整份 config 写回去」那种串味
-    const patch = b?.web && typeof b.web === 'object' ? b.web : b;
+    const patch = b?.web && typeof b.web === 'object' ? { ...b.web } : { ...b };
+    // 以前「逛逛」页多包了一层，整份设置被存进了 web.web、页面上怎么改都不生效。再收到这种就拆开
+    if (patch.web && typeof patch.web === 'object') Object.assign(patch, patch.web);
+    delete patch.web;
     writeConfig({ web: patch });
     return webvisit.view();
   },
@@ -676,8 +679,18 @@ server.on('error', (err) => {
   process.exit(1);
 });
 
+// launchd / systemd 停面板时发 SIGTERM：顺手把她的无头 Chrome 带走，别留个孤儿挂在后台
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.once(sig, () => {
+    const bye = () => process.exit(0);
+    web.shutdown().catch(() => {}).finally(bye);
+    setTimeout(bye, 10_000).unref();
+  });
+}
+
 server.listen(PORT, HOST, () => {
   console.log(`\n🐟 养鱼面板已启动：http://${HOST}:${PORT}\n`);
+  web.shutdown().catch(() => {}); // 上次面板留下的无头 Chrome 没人管了，先关掉，要用再开
   auto.startScheduler();
   webvisit.startScheduler(); // 贴吧 / 抖音：一天插进去几次串门，跟 B站 那套作息互不干扰
   qq.start(); // 用小号时连 NapCat；用官方机器人时什么都不做
